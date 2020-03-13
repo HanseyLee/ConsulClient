@@ -1,6 +1,7 @@
 package consul
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"strconv"
@@ -12,16 +13,23 @@ import (
 
 // Consul TTL status refer to https://www.consul.io/docs/agent/checks.html
 const (
-	TTLFail   = "fail"
-	TTLPass   = "pass"
-	TTLWarn   = "warn"
-	TTLUpdate = "update"
+	TTLFail = "fail"
+	TTLPass = "pass"
+	TTLWarn = "warn"
 )
 
-// one address one singleton
-var clientSingletonMap = make(map[string]*api.Client)
+var (
+	// one address one singleton
+	clientSingletonMap = make(map[string]*api.Client)
 
-var mu sync.Mutex
+	mu sync.Mutex
+
+	// HealthChanCap ...
+	HealthChanCap = 10
+
+	// HealthChan global
+	HealthChan = make(chan CheckPoint, HealthChanCap)
+)
 
 // Consul struct
 type Consul struct {
@@ -34,6 +42,16 @@ type Consul struct {
 	Port         int                    `json:"port,omitempty"`    // local service port
 	ID           string                 `json:"id,omitempty"`      // local service port
 	Check        *api.AgentServiceCheck `json:"checks,omitempty"`  // health check
+}
+
+// CheckPoint check runtime health point
+type CheckPoint struct {
+	App      string `json:"App,omitempty"`      // *Optional. App name
+	Reciever string `json:"Reciever,omitempty"` // *Optional. Reciever struct name if function is method
+	Function string `json:"Function,omitempty"` // *Optional. Function (or method) name
+	Name     string `json:"Name"`               // *Required. self-defined check point name
+	Status   bool   `json:"Status"`             // *Required. true is ok, false indicates exception etc.
+	Info     string `json:"Info"`               // *Required. info or error message
 }
 
 // NewConsul new Consul with initiated client
@@ -116,10 +134,13 @@ func (c *Consul) Register(ttlType bool, customizedHealthCheck func() (string, er
 	err := c.register()
 	if err == nil {
 		if ttlType {
+			checkID := "service:" + c.ID
+			c.Client.Agent().UpdateTTL(checkID, "initial health status report", TTLPass)
+			go c.urgentHealthReport()
 			if customizedHealthCheck == nil {
-				go c.reportHealthState(DefaultHealthCheck)
+				go c.routineHealthReport(DefaultHealthCheck)
 			} else {
-				go c.reportHealthState(customizedHealthCheck)
+				go c.routineHealthReport(customizedHealthCheck)
 			}
 		}
 	}
@@ -141,12 +162,6 @@ func (c *Consul) Deregister() error {
 // 	// catalog.deregister
 // }
 
-// DefaultHealthCheck simple response
-func DefaultHealthCheck() (string, error) {
-	now := time.Now().Format("2006-01-02 15:04:05")
-	return now + " " + LocalIP() + ": I'm OK", nil
-}
-
 // register a new service with the local agent
 func (c *Consul) register() error {
 	agent := c.Client.Agent()
@@ -161,20 +176,57 @@ func (c *Consul) register() error {
 	return agent.ServiceRegister(reg)
 }
 
-// reportHealthState TTL/2 period
-func (c *Consul) reportHealthState(customizedCheck func() (string, error)) {
+// DefaultHealthCheck simple response
+func DefaultHealthCheck() (string, error) {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	return now + " " + LocalIP() + ": I'm OK", nil
+}
+
+// urgentHealthReport start HealthChan channel to recieve urgent message and report
+// continuous repeated fail will always trigger watch alarm (alarm threshold is "fail")
+// skip healthy check point
+func (c *Consul) urgentHealthReport() {
+	for {
+		cp := <-HealthChan
+		if !cp.Status {
+			checkID := "service:" + c.ID
+			// make a status change, to ensure always trigger watch alarm
+			c.Client.Agent().UpdateTTL(checkID, "", TTLWarn)
+			if r, err := json.Marshal(cp); err == nil {
+				c.Client.Agent().UpdateTTL(checkID, string(r), TTLFail)
+			} else {
+				c.Client.Agent().UpdateTTL(checkID, cp.Info, TTLFail)
+			}
+			time.Sleep(time.Second * 1)
+		}
+	}
+}
+
+// routineHealthReport report customizedCheck func result in fixed period (TTL/2)
+// continuous repeated fail with same err string body will be triggered only once
+// continuous repeated fail with different err string body will be triggered multiple times
+func (c *Consul) routineHealthReport(customizedCheck func() (string, error)) {
 	d, err := time.ParseDuration(c.Check.TTL)
 	if err != nil {
 		panic("TTL Check duration panic, exit program")
 	}
+	lastStatus := true
+	lastErrMsg := ""
 	checkID := "service:" + c.ID
-	c.Client.Agent().UpdateTTL(checkID, "initial health status report...", TTLPass)
 	ticker := time.NewTicker(d / 2)
 	for range ticker.C {
 		if output, err := customizedCheck(); err == nil {
 			c.Client.Agent().UpdateTTL(checkID, output, TTLPass)
+			lastStatus = true
 		} else {
-			c.Client.Agent().UpdateTTL(checkID, err.Error(), TTLFail)
+			errMsg := err.Error()
+			if !lastStatus && lastErrMsg != errMsg {
+				// make a status change, to ensure trigger watch alarm
+				c.Client.Agent().UpdateTTL(checkID, "", TTLWarn)
+			}
+			c.Client.Agent().UpdateTTL(checkID, errMsg, TTLFail)
+			lastStatus = false
+			lastErrMsg = errMsg
 		}
 	}
 }
